@@ -343,12 +343,22 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
         self.message.merge_global_data = {"order": "981"}
         self.assert_refused("merge_global_data without template_id")
 
-    def test_refuse_tracking_with_template(self):
+    @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
+    def test_ignored_recipients_are_not_reported_sent(self):
+        self.message.to = ["ana@example.com", "bo@example.com"]
+        self.message.send()
+        self.assertEqual(set(self.message.anymail_status.recipients), {"ana@example.com"})
+
+    @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
+    def test_ignored_template_cc_is_not_reported_sent(self):
         self.message = AnymailMessage(
-            to=["ana@example.com"], template_id=TEMPLATE_ID, track_opens=True
+            to=["ana@example.com"], cc=["bo@example.com"], template_id=TEMPLATE_ID
         )
         self.message.from_email = None
-        self.assert_refused("track_opens and track_clicks with template_id")
+        self.message.send()
+        self.assert_sent({"to": "ana@example.com", "template_id": TEMPLATE_ID})
+        self.assertEqual(set(self.message.anymail_status.recipients), {"ana@example.com"})
+
 
     @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
     def test_ignore_unsupported_features_drops_them(self):
@@ -359,6 +369,36 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
         self.message.track_clicks = False
         self.message.send()
         self.assert_sent(PostHogConformanceTests.RENDERED)
+
+
+@tag("posthog")
+@override_settings(
+    MAILERS={
+        "default": {
+            "BACKEND": "anymail.backends.posthog.EmailBackend",
+            "OPTIONS": {
+                **POSTHOG_BASE_OPTIONS,
+                "send_defaults": {
+                    "track_clicks": True,
+                    "esp_extra": {"template_key": "transactional"},
+                },
+            },
+        },
+    },
+)
+class PostHogTemplateDefaultsTests(PostHogBackendMockAPITestCase):
+    """The template form leaves out rendered-form options, even from defaults"""
+
+    def test_template_omits_template_key_and_tracking(self):
+        self.message = AnymailMessage(
+            to=["ana@example.com"],
+            template_id=TEMPLATE_ID,
+            track_opens=True,
+            esp_extra={"capture_engagement": True},
+        )
+        self.message.from_email = None
+        self.message.send()
+        self.assert_sent({"to": "ana@example.com", "template_id": TEMPLATE_ID})
 
 
 @tag("posthog")
@@ -462,6 +502,23 @@ class PostHogErrorMapTests(PostHogBackendMockAPITestCase):
     def test_202_sent(self):
         self.message.send()
         self.assertEqual(self.message.anymail_status.status, {"queued"})
+
+    def assert_bad_success_response(self, **kw):
+        self.set_mock_response(status_code=202, **kw)
+        with self.assertRaisesMessage(AnymailAPIError, "PostHog API response") as cm:
+            self.message.send()
+        # A 2xx without a usable message_id is not a retryable status.
+        error = cm.exception
+        self.assertEqual(error.status_code, 202)
+        self.assertIsNone(error.code)
+        self.assertIs(error.retryable, False)
+        self.assertIsNone(error.retry_after)
+
+    def test_202_without_message_id(self):
+        self.assert_bad_success_response(json_data={})
+
+    def test_202_invalid_json(self):
+        self.assert_bad_success_response(raw=b"<html>ok</html>")
 
     def test_400_invalid_request(self):
         self.assert_api_error(400, "invalid_input", retryable=False)

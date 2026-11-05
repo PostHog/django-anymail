@@ -10,14 +10,15 @@ from anymail.message import AnymailMessage
 from .utils import AnymailTestMixin, override_settings, sample_image_content
 
 ANYMAIL_TEST_POSTHOG_SECRET_KEY = os.getenv("ANYMAIL_TEST_POSTHOG_SECRET_KEY")
-ANYMAIL_TEST_POSTHOG_API_URL = os.getenv(
-    "ANYMAIL_TEST_POSTHOG_API_URL", "https://us.posthog.com/"
+# CI exports unset repository variables as empty strings.
+ANYMAIL_TEST_POSTHOG_API_URL = (
+    os.getenv("ANYMAIL_TEST_POSTHOG_API_URL") or "https://us.posthog.com/"
 )
 # A sending domain verified in the PostHog project. Without it, the tests send
 # from the project's default sender.
 ANYMAIL_TEST_POSTHOG_DOMAIN = os.getenv("ANYMAIL_TEST_POSTHOG_DOMAIN")
-ANYMAIL_TEST_POSTHOG_RECIPIENT = os.getenv(
-    "ANYMAIL_TEST_POSTHOG_RECIPIENT", "test+to1@anymail.dev"
+ANYMAIL_TEST_POSTHOG_RECIPIENT = (
+    os.getenv("ANYMAIL_TEST_POSTHOG_RECIPIENT") or "test+to1@anymail.dev"
 )
 ANYMAIL_TEST_POSTHOG_TEMPLATE_ID = os.getenv("ANYMAIL_TEST_POSTHOG_TEMPLATE_ID")
 SENDER = (

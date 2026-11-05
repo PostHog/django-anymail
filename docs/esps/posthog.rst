@@ -191,6 +191,11 @@ Django fills in ``DEFAULT_FROM_EMAIL``, set ``from_email`` to ``None``:
     message.from_email = None  # use the template's sender
     message.send()
 
+A template send leaves out ``template_key``, ``capture_engagement``,
+:attr:`~anymail.message.AnymailMessage.track_opens` and
+:attr:`~anymail.message.AnymailMessage.track_clicks`, so defaults you set for rendered
+sends don't break template sends.
+
 PostHog doesn't support batch sending, so
 :attr:`~anymail.message.AnymailMessage.merge_data` is unsupported.
 
@@ -214,8 +219,13 @@ A 503 or a network error can still deliver the email. Retrying without the same
 ``idempotency_key`` may send it twice. If you send through a task queue that retries,
 set ``idempotency_key`` from a stable ID, such as the order ID plus the email's name.
 
+A success response without a ``message_id`` raises an
+:exc:`~anymail.exceptions.AnymailAPIError` that is not ``retryable``.
+
 On success, :attr:`~anymail.message.AnymailMessage.anymail_status` has status
-``"queued"`` and PostHog's ``message_id`` for every recipient.
+``"queued"`` and PostHog's ``message_id`` for every recipient PostHog was sent. With
+:setting:`ANYMAIL_IGNORE_UNSUPPORTED_FEATURES`, recipients Anymail left out
+(extra ``to`` addresses, or ``cc`` and ``bcc`` on a template send) get no status.
 
 
 .. _posthog-webhooks:

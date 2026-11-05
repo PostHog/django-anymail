@@ -63,9 +63,18 @@ class EmailBackend(AnymailRequestsBackend):
             raise
 
     def parse_recipient_status(self, response, payload, message):
+        try:
+            message_id = self.parse_message_id(response, payload, message)
+        except AnymailRequestsAPIError as error:
+            describe_api_error(error)
+            raise
+        status = AnymailRecipientStatus(message_id=message_id, status="queued")
+        return {email.addr_spec: status for email in payload.recipients}
+
+    def parse_message_id(self, response, payload, message):
         parsed_response = self.deserialize_json_response(response, payload, message)
         try:
-            message_id = parsed_response["message_id"]
+            return parsed_response["message_id"]
         except (KeyError, TypeError) as err:
             raise AnymailRequestsAPIError(
                 "Invalid PostHog API response format",
@@ -74,8 +83,6 @@ class EmailBackend(AnymailRequestsBackend):
                 response=response,
                 backend=self,
             ) from err
-        status = AnymailRecipientStatus(message_id=message_id, status="queued")
-        return {email.addr_spec: status for email in payload.recipients}
 
 
 def describe_api_error(error):
@@ -117,7 +124,7 @@ def parse_retry_after(response):
 
 class PostHogPayload(RequestsPayload):
     def __init__(self, message, defaults, backend, *args, **kwargs):
-        self.recipients = []  # for parse_recipient_status
+        self.recipients_by_field = {}
         self.from_email = None
         self.track_opens = None
         self.track_clicks = None
@@ -127,6 +134,16 @@ class PostHogPayload(RequestsPayload):
         headers["Accept"] = "application/json"
         headers["X-PostHog-Integration"] = f"django-anymail/{__version__}"
         super().__init__(message, defaults, backend, headers=headers, *args, **kwargs)
+
+    @property
+    def recipients(self):
+        """The recipients the request carries, for parse_recipient_status"""
+        return [
+            email
+            for field, emails in self.recipients_by_field.items()
+            if field in self.data
+            for email in emails
+        ]
 
     def get_api_endpoint(self):
         return "api/projects/@current/messaging/send/email/"
@@ -147,8 +164,10 @@ class PostHogPayload(RequestsPayload):
             )
             for field in found:
                 del self.data[field]
-        if self.track_opens is not None or self.track_clicks is not None:
-            self.unsupported_feature("track_opens and track_clicks with template_id")
+        # Rendered-form options, maybe from send defaults; the template form
+        # has no place for them.
+        self.data.pop("template_key", None)
+        self.data.pop("capture_engagement", None)
 
     def finish_rendered_form(self):
         if "message_data" in self.data:
@@ -186,16 +205,16 @@ class PostHogPayload(RequestsPayload):
         ]
 
     def set_to(self, emails):
-        self.recipients += emails
         if len(emails) != 1:
             self.unsupported_feature("more than one `to` address, or none")
         if emails:
-            self.data["to"] = self.bare_addresses(emails)[0]
+            self.recipients_by_field["to"] = emails[:1]
+            self.data["to"] = self.bare_addresses(emails[:1])[0]
 
     def set_recipients(self, recipient_type, emails):
         assert recipient_type in ["cc", "bcc"]
-        self.recipients += emails
         if emails:
+            self.recipients_by_field[recipient_type] = emails
             self.data[recipient_type] = self.bare_addresses(emails)
 
     def set_subject(self, subject):
