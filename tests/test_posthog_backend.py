@@ -347,7 +347,9 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
     def test_ignored_recipients_are_not_reported_sent(self):
         self.message.to = ["ana@example.com", "bo@example.com"]
         self.message.send()
-        self.assertEqual(set(self.message.anymail_status.recipients), {"ana@example.com"})
+        self.assertEqual(
+            set(self.message.anymail_status.recipients), {"ana@example.com"}
+        )
 
     @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
     def test_ignored_template_cc_is_not_reported_sent(self):
@@ -357,8 +359,9 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
         self.message.from_email = None
         self.message.send()
         self.assert_sent({"to": "ana@example.com", "template_id": TEMPLATE_ID})
-        self.assertEqual(set(self.message.anymail_status.recipients), {"ana@example.com"})
-
+        self.assertEqual(
+            set(self.message.anymail_status.recipients), {"ana@example.com"}
+        )
 
     @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
     def test_ignore_unsupported_features_drops_them(self):
