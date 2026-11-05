@@ -138,6 +138,10 @@ parts and send anyway---see :ref:`unsupported-features`.
   :attr:`~anymail.message.AnymailMessage.track_clicks` set it when only one is set or
   both agree; different values are unsupported.
 
+**Attachment types have no parameters**
+  PostHog takes an attachment's MIME type without parameters such as ``charset``,
+  so Anymail sends text attachments encoded as UTF-8.
+
 **Inline images need a Content-ID**
   Inline attachments are sent with their Content-ID. An inline attachment without one
   is unsupported.

@@ -20,7 +20,12 @@ from .mock_requests_backend import (
     RequestsBackendMockAPITestCase,
     SessionSharingTestCases,
 )
-from .utils import AnymailTestMixin, override_settings
+from .utils import (
+    AnymailTestMixin,
+    create_text_attachment,
+    decode_att,
+    override_settings,
+)
 
 POSTHOG_BASE_OPTIONS = {"secret_key": "phs_test_secret_key"}
 SEND_URL = "https://us.posthog.com/api/projects/@current/messaging/send/email/"
@@ -349,6 +354,19 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
 
 @tag("posthog")
 class PostHogSendTests(PostHogBackendMockAPITestCase):
+    def test_text_attachment_sends_bare_mime_type_and_utf8(self):
+        # PostHog takes a MIME type with no parameters, so the charset can't
+        # travel with it; the content goes as UTF-8.
+        self.message.attach(
+            create_text_attachment(
+                "pièce jointe\n", charset="iso-8859-1", filename="note.txt"
+            )
+        )
+        self.message.send()
+        attachment = self.get_api_call_json()["attachments"][0]
+        self.assertEqual(attachment["content_type"], "text/plain")
+        self.assertEqual(decode_att(attachment["content"]).decode(), "pièce jointe\n")
+
     def test_send_mail(self):
         mail.send_mail("Subject", "Body", "from@example.com", ["to@example.com"])
         self.assert_sent(

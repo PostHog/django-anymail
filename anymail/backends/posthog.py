@@ -218,10 +218,11 @@ class PostHogPayload(RequestsPayload):
             self.add_content_field("html", body)
 
     def make_attachment(self, attachment):
+        # PostHog takes a bare MIME type, so text goes as UTF-8.
         att = {
             "filename": attachment.name,
-            "content_type": attachment.content_type,
-            "content": attachment.b64content,
+            "content_type": attachment.mimetype,
+            "content": attachment.b64content_utf8,
         }
         if attachment.inline:
             if not attachment.cid:
