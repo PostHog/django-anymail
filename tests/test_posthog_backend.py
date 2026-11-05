@@ -300,6 +300,15 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
         self.message.template_id = TEMPLATE_ID
         self.assert_refused("template_id with from_email, subject, body")
 
+    def test_17_refuse_template_with_content_in_esp_extra(self):
+        self.message = AnymailMessage(
+            to=["ana@example.com"],
+            template_id=TEMPLATE_ID,
+            esp_extra={"subject": "Your order shipped"},
+        )
+        self.message.from_email = None
+        self.assert_refused("(found subject)")
+
 
 @tag("posthog")
 class PostHogRefusalTests(PostHogBackendMockAPITestCase):

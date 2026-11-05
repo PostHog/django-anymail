@@ -11,6 +11,18 @@ TEMPLATE_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,400}$")
 # Headers Django or a mail library adds on its own; PostHog writes its own.
 IGNORED_HEADERS = {"message-id", "date", "mime-version", "x-mailer"}
 
+# Rendered-form fields; PostHog's template form takes none of them.
+CONTENT_FIELDS = (
+    "from",
+    "subject",
+    "text",
+    "html",
+    "reply_to",
+    "cc",
+    "bcc",
+    "attachments",
+)
+
 
 def is_ignored_header(name):
     name = name.lower()
@@ -109,7 +121,6 @@ class PostHogPayload(RequestsPayload):
         self.from_email = None
         self.track_opens = None
         self.track_clicks = None
-        self.content_fields = []
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {backend.secret_key}"
         headers["Content-Type"] = "application/json"
@@ -128,13 +139,14 @@ class PostHogPayload(RequestsPayload):
         return self.serialize_json(self.data)
 
     def check_template_form(self):
-        if self.content_fields:
+        found = [field for field in CONTENT_FIELDS if field in self.data]
+        if found:
             self.unsupported_feature(
                 "template_id with from_email, subject, body, reply_to, cc, bcc"
-                f" or attachments (found {', '.join(self.content_fields)})"
+                f" or attachments (found {', '.join(found)})"
             )
-            for field in self.content_fields:
-                self.data.pop(field, None)
+            for field in found:
+                del self.data[field]
         if self.track_opens is not None or self.track_clicks is not None:
             self.unsupported_feature("track_opens and track_clicks with template_id")
 
@@ -156,10 +168,6 @@ class PostHogPayload(RequestsPayload):
             return None
         return tracking.pop() if tracking else None
 
-    def add_content_field(self, field, value):
-        self.data[field] = value
-        self.content_fields.append(field)
-
     #
     # Payload construction
     #
@@ -169,9 +177,7 @@ class PostHogPayload(RequestsPayload):
 
     def set_from_email(self, email):
         self.from_email = email
-        self.add_content_field(
-            "from", email.format(idna_encode=self.backend.idna_encode)
-        )
+        self.data["from"] = email.format(idna_encode=self.backend.idna_encode)
 
     def bare_addresses(self, emails):
         return [
@@ -190,15 +196,15 @@ class PostHogPayload(RequestsPayload):
         assert recipient_type in ["cc", "bcc"]
         self.recipients += emails
         if emails:
-            self.add_content_field(recipient_type, self.bare_addresses(emails))
+            self.data[recipient_type] = self.bare_addresses(emails)
 
     def set_subject(self, subject):
         if subject:
-            self.add_content_field("subject", subject)
+            self.data["subject"] = subject
 
     def set_reply_to(self, emails):
         if emails:
-            self.add_content_field("reply_to", self.bare_addresses(emails))
+            self.data["reply_to"] = self.bare_addresses(emails)
 
     def set_extra_headers(self, headers):
         for name in headers:
@@ -207,15 +213,11 @@ class PostHogPayload(RequestsPayload):
 
     def set_text_body(self, body):
         if body:
-            self.add_content_field("text", body)
+            self.data["text"] = body
 
     def set_html_body(self, body):
-        if "html" in self.data:
-            # second html body could show up through multiple alternatives,
-            # or html body + alternative
-            self.unsupported_feature("multiple html parts")
         if body:
-            self.add_content_field("html", body)
+            self.data["html"] = body
 
     def make_attachment(self, attachment):
         # PostHog takes a bare MIME type, so text goes as UTF-8.
@@ -233,10 +235,9 @@ class PostHogPayload(RequestsPayload):
 
     def set_attachments(self, attachments):
         if attachments:
-            self.add_content_field(
-                "attachments",
-                [self.make_attachment(attachment) for attachment in attachments],
-            )
+            self.data["attachments"] = [
+                self.make_attachment(attachment) for attachment in attachments
+            ]
 
     def set_envelope_sender(self, email):
         if self.from_email is None or email.addr_spec != self.from_email.addr_spec:
