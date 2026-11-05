@@ -6,13 +6,11 @@ from ..message import AnymailRecipientStatus
 from ..utils import get_anymail_setting
 from .base_requests import AnymailRequestsBackend, RequestsPayload
 
-TEMPLATE_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,400}$")
+TEMPLATE_KEY_PATTERN = re.compile(r"[a-zA-Z0-9_-]{1,400}")
 
-# Headers Django or a mail library adds on its own; PostHog writes its own.
-IGNORED_HEADERS = {"message-id", "date", "mime-version", "x-mailer"}
+AUTOMATIC_HEADERS = {"message-id", "date", "mime-version", "x-mailer"}
 
-# Rendered-form fields; PostHog's template form takes none of them.
-CONTENT_FIELDS = (
+RENDERED_CONTENT_FIELDS = (
     "from",
     "subject",
     "text",
@@ -23,10 +21,22 @@ CONTENT_FIELDS = (
     "attachments",
 )
 
+RENDERED_ONLY_OPTIONS = ("template_key", "capture_engagement")
 
-def is_ignored_header(name):
+
+def is_automatic_header(name):
     name = name.lower()
-    return name in IGNORED_HEADERS or name.startswith("content-")
+    return name in AUTOMATIC_HEADERS or name.startswith("content-")
+
+
+def is_valid_template_key(template_key):
+    return isinstance(template_key, str) and bool(
+        TEMPLATE_KEY_PATTERN.fullmatch(template_key)
+    )
+
+
+def is_message_id(value):
+    return isinstance(value, str) and bool(value)
 
 
 class EmailBackend(AnymailRequestsBackend):
@@ -73,16 +83,20 @@ class EmailBackend(AnymailRequestsBackend):
 
     def parse_message_id(self, response, payload, message):
         parsed_response = self.deserialize_json_response(response, payload, message)
-        try:
-            return parsed_response["message_id"]
-        except (KeyError, TypeError) as err:
+        message_id = (
+            parsed_response.get("message_id")
+            if isinstance(parsed_response, dict)
+            else None
+        )
+        if not is_message_id(message_id):
             raise AnymailRequestsAPIError(
                 "Invalid PostHog API response format",
                 email_message=message,
                 payload=payload,
                 response=response,
                 backend=self,
-            ) from err
+            )
+        return message_id
 
 
 def describe_api_error(error):
@@ -97,7 +111,6 @@ def describe_api_error(error):
     error.attr = body.get("attr")
     error.retry_after = None
     if response is None:
-        # A network error or timeout: the email may have gone out.
         error.retryable = True
     elif response.status_code == 429:
         error.retryable = error.code != "quota_limited"
@@ -156,7 +169,7 @@ class PostHogPayload(RequestsPayload):
         return self.serialize_json(self.data)
 
     def check_template_form(self):
-        found = [field for field in CONTENT_FIELDS if field in self.data]
+        found = [field for field in RENDERED_CONTENT_FIELDS if field in self.data]
         if found:
             self.unsupported_feature(
                 "template_id with from_email, subject, body, reply_to, cc, bcc"
@@ -164,10 +177,8 @@ class PostHogPayload(RequestsPayload):
             )
             for field in found:
                 del self.data[field]
-        # Rendered-form options, maybe from send defaults; the template form
-        # has no place for them.
-        self.data.pop("template_key", None)
-        self.data.pop("capture_engagement", None)
+        for option in RENDERED_ONLY_OPTIONS:
+            self.data.pop(option, None)
 
     def finish_rendered_form(self):
         if "message_data" in self.data:
@@ -187,12 +198,8 @@ class PostHogPayload(RequestsPayload):
             return None
         return tracking.pop() if tracking else None
 
-    #
-    # Payload construction
-    #
-
     def init_payload(self):
-        self.data = {}  # becomes json
+        self.data = {}
 
     def set_from_email(self, email):
         self.from_email = email
@@ -227,7 +234,7 @@ class PostHogPayload(RequestsPayload):
 
     def set_extra_headers(self, headers):
         for name in headers:
-            if not is_ignored_header(name):
+            if not is_automatic_header(name):
                 self.unsupported_feature(f"custom header {name!r}")
 
     def set_text_body(self, body):
@@ -239,7 +246,6 @@ class PostHogPayload(RequestsPayload):
             self.data["html"] = body
 
     def make_attachment(self, attachment):
-        # PostHog takes a bare MIME type, so text goes as UTF-8.
         att = {
             "filename": attachment.name,
             "content_type": attachment.mimetype,
@@ -282,7 +288,7 @@ class PostHogPayload(RequestsPayload):
         if idempotency_key is not None:
             self.headers["Idempotency-Key"] = idempotency_key
         template_key = extra.get("template_key")
-        if template_key is not None and not TEMPLATE_KEY_PATTERN.match(template_key):
+        if template_key is not None and not is_valid_template_key(template_key):
             self.unsupported_feature(
                 f"template_key {template_key!r} (use letters, numbers,"
                 " hyphens and underscores, at most 400)"

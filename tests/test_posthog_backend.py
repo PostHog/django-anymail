@@ -213,6 +213,14 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
         self.message.esp_extra = {"template_key": "order shipped!"}
         self.assert_refused("template_key 'order shipped!'")
 
+    def test_08_refuse_template_key_with_trailing_newline(self):
+        self.message.esp_extra = {"template_key": "order-shipped\n"}
+        self.assert_refused("template_key 'order-shipped\\n'")
+
+    def test_08_refuse_template_key_not_a_string(self):
+        self.message.esp_extra = {"template_key": 42}
+        self.assert_refused("template_key 42")
+
     def test_09_refuse_multiple_to(self):
         self.message.to = ["ana@example.com", "bo@example.com"]
         self.assert_refused("more than one `to` address")
@@ -519,6 +527,11 @@ class PostHogErrorMapTests(PostHogBackendMockAPITestCase):
 
     def test_202_without_message_id(self):
         self.assert_bad_success_response(json_data={})
+
+    def test_202_with_unusable_message_id(self):
+        for message_id in [None, "", ["0190f0c2"], {"id": "0190f0c2"}]:
+            with self.subTest(message_id=message_id):
+                self.assert_bad_success_response(json_data={"message_id": message_id})
 
     def test_202_invalid_json(self):
         self.assert_bad_success_response(raw=b"<html>ok</html>")
