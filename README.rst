@@ -35,6 +35,7 @@ Anymail currently supports these ESPs:
 * **Mailtrap**
 * **Mandrill** (MailChimp transactional email)
 * **Postal** (self-hosted ESP)
+* **PostHog**
 * **Postmark** (ActiveCampaign transactional email)
 * **Resend**
 * **Scaleway TEM**

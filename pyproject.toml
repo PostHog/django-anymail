@@ -14,7 +14,7 @@ authors = [
 ]
 description = """\
 Django email backends and webhooks for Amazon SES, Brevo,
- MailerSend, Mailgun, Mailjet, Mailtrap, Mandrill, Postal, Postmark, Resend,
+ MailerSend, Mailgun, Mailjet, Mailtrap, Mandrill, Postal, PostHog, Postmark, Resend,
  Scaleway TEM, SendGrid, SparkPost, and Unisender Go
  (EmailBackend, transactional email tracking and inbound email signals)\
 """
@@ -30,6 +30,7 @@ keywords = [
     "Mailtrap",
     "Mandrill", "MailChimp",
     "Postal",
+    "PostHog",
     "Postmark", "ActiveCampaign",
     "Resend",
     "Scaleway", "Scaleway TEM",
@@ -81,6 +82,7 @@ mailjet = []
 mailtrap = []
 mandrill = []
 postal = ["cryptography"]
+posthog = []
 postmark = []
 resend = ["svix"]
 scaleway = []

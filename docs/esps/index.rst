@@ -20,6 +20,7 @@ and notes about any quirks or limitations:
    mailtrap
    mandrill
    postal
+   posthog
    postmark
    resend
    scaleway
