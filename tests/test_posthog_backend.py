@@ -947,6 +947,32 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
         self.assertEqual(self.calls("http://attachments.example.com"), [])
         self.assert_not_sent()
 
+    def test_malformed_upload_url_is_an_api_error(self):
+        slot = upload_slot({"sha256": sha256_hex(INVOICE), "size": len(INVOICE)})
+        slot["url"] = "https://"
+        self.fake_posthog(
+            uploads=self.response(
+                200, {"files": [slot, present_slot({"sha256": sha256_hex(LOGO)})]}
+            )
+        )
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        self.assertEqual(cm.exception.code, "attachment_upload_failed")
+        self.assertEqual(cm.exception.attr, "attachments__0")
+        self.assertIs(cm.exception.retryable, False)
+        self.assert_not_sent()
+
+    def test_malformed_upload_url_fails_silently(self):
+        slot = upload_slot({"sha256": sha256_hex(INVOICE), "size": len(INVOICE)})
+        slot["url"] = "https://"
+        self.fake_posthog(
+            uploads=self.response(
+                200, {"files": [slot, present_slot({"sha256": sha256_hex(LOGO)})]}
+            )
+        )
+        self.assertEqual(self.message.send(fail_silently=True), 0)
+        self.assert_not_sent()
+
     def test_storage_refusal_is_not_retryable(self):
         self.fake_posthog(
             storage=self.response(

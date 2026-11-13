@@ -193,12 +193,26 @@ class EmailBackend(AnymailRequestsBackend):
         index = upload.file.attachment_index
         # A prepared request skips the session's headers, auth and .netrc
         # credentials, which are for PostHog's API, not for the storage host.
-        request = requests.Request(
-            method=upload.method,
-            url=upload.url,
-            data=upload.file.content,
-            headers=upload.headers,
-        ).prepare()
+        try:
+            request = requests.Request(
+                method=upload.method,
+                url=upload.url,
+                data=upload.file.content,
+                headers=upload.headers,
+            ).prepare()
+        except requests.RequestException as err:
+            error = request_error(
+                f"PostHog answered an upload URL for attachment {index}"
+                " that Anymail can't send to, so Anymail sent no email",
+                err,
+                email_message=message,
+                payload=payload,
+                backend=self,
+            )
+            describe_storage_error(error, index)
+            # The same PostHog would answer the same URL again.
+            error.retryable = False
+            raise error from err
         transport = self.session.merge_environment_settings(
             request.url, proxies={}, stream=False, verify=None, cert=None
         )
