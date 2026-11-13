@@ -30,6 +30,12 @@ vNext
 
 *Unreleased changes*
 
+Features
+~~~~~~~~
+
+* **PostHog:** Add support for this ESP.
+  (See `docs <https://anymail.dev/en/latest/esps/posthog/>`__.)
+
 Fixes
 ~~~~~
 
