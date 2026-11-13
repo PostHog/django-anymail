@@ -100,6 +100,7 @@ class PostHogBackendIntegrationTests(AnymailTestMixin, SimpleTestCase):
             esp_extra={
                 "distinct_id": "anymail-integration-test",
                 "template_key": "anymail-integration-test",
+                "sensitive": True,
             },
         )
         message.from_email = SENDER

@@ -1,4 +1,6 @@
-from base64 import b64decode
+import hashlib
+import json
+from base64 import b64decode, b64encode
 from datetime import datetime, timezone
 from email.message import MIMEPart
 from email.mime.image import MIMEImage
@@ -23,13 +25,45 @@ from .mock_requests_backend import (
 from .utils import (
     AnymailTestMixin,
     create_text_attachment,
-    decode_att,
     override_settings,
 )
 
 POSTHOG_BASE_OPTIONS = {"secret_key": "phs_test_secret_key"}
 SEND_URL = "https://us.posthog.com/api/projects/@current/messaging/send/email/"
+UPLOADS_URL = (
+    "https://us.posthog.com/api/projects/@current/messaging/attachments/uploads/"
+)
+STORAGE_URL = "https://attachments.s3.us-east-1.amazonaws.com/team/1/"
+INVOICE = b64decode("JVBERi0xLjQK")
+LOGO = b64decode("iVBORw0KGgo=")
 TEMPLATE_ID = "0190f0c2-7d1e-7a3b-9c2e-5f1a2b3c4d5e"
+
+
+def sha256_hex(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+def upload_slot(file):
+    digest = bytes.fromhex(file["sha256"])
+    return {
+        "sha256": file["sha256"],
+        "status": "upload",
+        "url": f"{STORAGE_URL}{file['sha256']}?X-Amz-Signature=abc",
+        "method": "PUT",
+        "headers": {
+            "Content-Length": str(file["size"]),
+            "x-amz-checksum-sha256": b64encode(digest).decode(),
+        },
+        "url_expires_at": "2026-11-13T09:15:00Z",
+    }
+
+
+def present_slot(file):
+    return {
+        "sha256": file["sha256"],
+        "status": "present",
+        "expires_at": "2026-12-16T09:00:00Z",
+    }
 
 
 def attach_inline(message, content, filename, subtype, content_id=None):
@@ -97,6 +131,57 @@ class PostHogBackendMockAPITestCase(RequestsBackendMockAPITestCase):
             self.message.send()
         self.assert_esp_not_called()
 
+    def response(self, status_code, json_data=None, raw=b"", headers=None):
+        if json_data is not None:
+            raw = json.dumps(json_data).encode()
+        response = self.MockResponse(
+            status_code,
+            raw,
+            "application/json" if json_data is not None else None,
+            test_case=self,
+        )
+        response.headers.update(headers or {})
+        return response
+
+    def fake_posthog(self, present=(), uploads=None, storage=None):
+        """Answer the upload route, the file storage and the send like PostHog.
+
+        uploads and storage replace PostHog's answer on that route; storage
+        may be an exception to raise instead.
+        """
+
+        def request(session, method, url, **kwargs):
+            if url == UPLOADS_URL:
+                if uploads is not None:
+                    return uploads
+                files = json.loads(kwargs["data"])["files"]
+                slots = [
+                    (
+                        present_slot(file)
+                        if file["sha256"] in present
+                        else upload_slot(file)
+                    )
+                    for file in files
+                ]
+                return self.response(200, {"files": slots})
+            if url.startswith(STORAGE_URL):
+                if isinstance(storage, Exception):
+                    raise storage
+                return storage if storage is not None else self.response(200)
+            return self.response(202, json.loads(self.DEFAULT_RAW_RESPONSE))
+
+        self.mock_request.side_effect = request
+
+    def calls(self, url_prefix):
+        return [
+            call.kwargs
+            for call in self.mock_request.call_args_list
+            if call.kwargs["url"].startswith(url_prefix)
+        ]
+
+    def assert_not_sent(self):
+        self.assertEqual(self.calls(SEND_URL), [])
+
 
 @tag("posthog")
 class PostHogConformanceTests(PostHogBackendMockAPITestCase):
@@ -142,6 +227,7 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
         )
 
     def test_04_attachments_and_inline(self):
+        self.fake_posthog()
         message = AnymailMessage(
             subject="Your order shipped",
             body="On its way.",
@@ -149,8 +235,8 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
             to=["Ana <ana@example.com>"],
         )
         message.attach_alternative('<img src="cid:logo">', "text/html")
-        message.attach("invoice.pdf", b64decode("JVBERi0xLjQK"), "application/pdf")
-        attach_inline(message, b64decode("iVBORw0KGgo="), "logo.png", "png", "<logo>")
+        message.attach("invoice.pdf", INVOICE, "application/pdf")
+        attach_inline(message, LOGO, "logo.png", "png", "<logo>")
         message.send()
         self.assert_sent(
             {
@@ -158,14 +244,14 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
                 "html": '<img src="cid:logo">',
                 "attachments": [
                     {
+                        "sha256": sha256_hex(INVOICE),
                         "filename": "invoice.pdf",
                         "content_type": "application/pdf",
-                        "content": "JVBERi0xLjQK",
                     },
                     {
+                        "sha256": sha256_hex(LOGO),
                         "filename": "logo.png",
                         "content_type": "image/png",
-                        "content": "iVBORw0KGgo=",
                         "content_id": "logo",
                     },
                 ],
@@ -186,7 +272,7 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
                 **self.RENDERED,
                 "template_key": "order-shipped",
                 "distinct_id": "user_42",
-                "capture_engagement": False,
+                "tracking": {"opens": False, "clicks": False},
             },
             idempotency_key="order-981-shipped",
         )
@@ -216,6 +302,15 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
     def test_08_refuse_template_key_with_trailing_newline(self):
         self.message.esp_extra = {"template_key": "order-shipped\n"}
         self.assert_refused("template_key 'order-shipped\\n'")
+
+    def test_08_refuse_template_key_longer_than_posthog_takes(self):
+        self.message.esp_extra = {"template_key": "k" * 257}
+        self.assert_refused("at most 256")
+
+    def test_08_template_key_at_posthog_limit_sends(self):
+        self.message.esp_extra = {"template_key": "k" * 256}
+        self.message.send()
+        self.assert_sent({**self.RENDERED, "template_key": "k" * 256})
 
     def test_08_refuse_template_key_not_a_string(self):
         self.message.esp_extra = {"template_key": 42}
@@ -265,24 +360,72 @@ class PostHogConformanceTests(PostHogBackendMockAPITestCase):
         self.message.send()
         self.assert_sent(self.RENDERED)
 
-    def test_14_refuse_mixed_tracking(self):
-        self.message.track_opens = True
-        self.message.track_clicks = False
-        self.assert_refused("track_opens and track_clicks set to different values")
-
-    def test_14_tracking_that_agrees(self):
-        for tracking in (True, False):
-            with self.subTest(tracking=tracking):
+    def test_14_tracking_maps_each_control(self):
+        cases = [
+            ((True, True), {"opens": True, "clicks": True}),
+            ((False, False), {"opens": False, "clicks": False}),
+            ((True, False), {"opens": True, "clicks": False}),
+            ((True, None), {"opens": True}),
+            ((False, None), {"opens": False}),
+            ((None, True), {"clicks": True}),
+            ((None, False), {"clicks": False}),
+        ]
+        for (track_opens, track_clicks), tracking in cases:
+            with self.subTest(track_opens=track_opens, track_clicks=track_clicks):
                 message = self.order_shipped()
-                message.track_opens = tracking
-                message.track_clicks = tracking
+                message.track_opens = track_opens
+                message.track_clicks = track_clicks
                 message.send()
-                self.assert_sent({**self.RENDERED, "capture_engagement": tracking})
+                self.assert_sent({**self.RENDERED, "tracking": tracking})
 
-    def test_14_one_tracking_option_sets_capture_engagement(self):
-        self.message.track_clicks = False
+    def test_14_no_tracking_controls_send_no_tracking(self):
+        self.message.send()
+        body = self.get_api_call_json()
+        self.assertNotIn("tracking", body)
+        self.assertNotIn("capture_engagement", body)
+
+    def test_14_refuse_clicks_without_opens(self):
+        self.message.track_opens = False
+        self.message.track_clicks = True
+        self.assert_refused("track_clicks without track_opens")
+
+    @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
+    def test_14_ignored_clicks_without_opens_send_opens_off(self):
+        self.message.track_opens = False
+        self.message.track_clicks = True
+        self.message.send()
+        self.assert_sent({**self.RENDERED, "tracking": {"opens": False}})
+
+    def test_14_capture_engagement_in_esp_extra_joins_tracking(self):
+        # PostHog refuses capture_engagement beside tracking, so it travels
+        # as tracking.engagement.
+        self.message.track_opens = True
+        self.message.esp_extra = {"capture_engagement": False}
+        self.message.send()
+        self.assert_sent(
+            {**self.RENDERED, "tracking": {"opens": True, "engagement": False}}
+        )
+
+    def test_14_capture_engagement_alone_passes_through(self):
+        self.message.esp_extra = {"capture_engagement": False}
         self.message.send()
         self.assert_sent({**self.RENDERED, "capture_engagement": False})
+
+    def test_14_tracking_in_esp_extra_merges_with_controls(self):
+        self.message.track_clicks = False
+        self.message.esp_extra = {"tracking": {"engagement": False}}
+        self.message.send()
+        self.assert_sent(
+            {**self.RENDERED, "tracking": {"clicks": False, "engagement": False}}
+        )
+
+    def test_14_sensitive_passes_through(self):
+        self.message.track_clicks = True
+        self.message.esp_extra = {"sensitive": True}
+        self.message.send()
+        self.assert_sent(
+            {**self.RENDERED, "sensitive": True, "tracking": {"clicks": True}}
+        )
 
     def test_15_template_form(self):
         self.message = AnymailMessage(
@@ -376,8 +519,6 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
         self.message.to = ["ana@example.com", "bo@example.com"]
         self.message.tags = ["receipts"]
         self.message.extra_headers = {"X-Campaign": "spring"}
-        self.message.track_opens = True
-        self.message.track_clicks = False
         self.message.send()
         self.assert_sent(PostHogConformanceTests.RENDERED)
 
@@ -391,7 +532,11 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
                 **POSTHOG_BASE_OPTIONS,
                 "send_defaults": {
                     "track_clicks": True,
-                    "esp_extra": {"template_key": "transactional"},
+                    "esp_extra": {
+                        "template_key": "transactional",
+                        "sensitive": True,
+                        "tracking": {"engagement": False},
+                    },
                 },
             },
         },
@@ -400,7 +545,7 @@ class PostHogRefusalTests(PostHogBackendMockAPITestCase):
 class PostHogTemplateDefaultsTests(PostHogBackendMockAPITestCase):
     """The template form leaves out rendered-form options, even from defaults"""
 
-    def test_template_omits_template_key_and_tracking(self):
+    def test_template_omits_template_key_tracking_and_sensitive(self):
         self.message = AnymailMessage(
             to=["ana@example.com"],
             template_id=TEMPLATE_ID,
@@ -417,15 +562,19 @@ class PostHogSendTests(PostHogBackendMockAPITestCase):
     def test_text_attachment_sends_bare_mime_type_and_utf8(self):
         # PostHog takes a MIME type with no parameters, so the charset can't
         # travel with it; the content goes as UTF-8.
+        self.fake_posthog()
         self.message.attach(
             create_text_attachment(
                 "pièce jointe\n", charset="iso-8859-1", filename="note.txt"
             )
         )
         self.message.send()
+        content = "pièce jointe\n".encode()
+        (upload,) = self.calls(STORAGE_URL)
+        self.assertEqual(upload["data"], content)
         attachment = self.get_api_call_json()["attachments"][0]
         self.assertEqual(attachment["content_type"], "text/plain")
-        self.assertEqual(decode_att(attachment["content"]).decode(), "pièce jointe\n")
+        self.assertEqual(attachment["sha256"], sha256_hex(content))
 
     def test_send_mail(self):
         mail.send_mail("Subject", "Body", "from@example.com", ["to@example.com"])
@@ -483,6 +632,316 @@ class PostHogSendTests(PostHogBackendMockAPITestCase):
         with self.assertRaises(AnymailAPIError):
             self.message.send()
         self.assertEqual(self.mock_request.call_count, 1)
+
+
+@tag("posthog")
+class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
+    """Files go to PostHog's upload route and file storage before the send"""
+
+    def setUp(self):
+        super().setUp()
+        self.message.attach("invoice.pdf", INVOICE, "application/pdf")
+        self.message.attach("logo.png", LOGO, "image/png")
+
+    def test_asks_where_to_upload_then_uploads_then_sends(self):
+        self.fake_posthog()
+        self.message.esp_extra = {"idempotency_key": "order-981-shipped"}
+        self.message.send()
+        urls = [call.kwargs["url"] for call in self.mock_request.call_args_list]
+        self.assertEqual(
+            [url.split("?")[0] for url in urls],
+            [
+                UPLOADS_URL,
+                STORAGE_URL + sha256_hex(INVOICE),
+                STORAGE_URL + sha256_hex(LOGO),
+                SEND_URL,
+            ],
+        )
+        (ask,) = self.calls(UPLOADS_URL)
+        self.assertEqual(ask["method"], "POST")
+        self.assertEqual(
+            json.loads(ask["data"]),
+            {
+                "files": [
+                    {"sha256": sha256_hex(INVOICE), "size": len(INVOICE)},
+                    {"sha256": sha256_hex(LOGO), "size": len(LOGO)},
+                ]
+            },
+        )
+        self.assertEqual(ask["headers"]["Authorization"], "Bearer phs_test_secret_key")
+        self.assertEqual(
+            ask["headers"]["X-PostHog-Integration"], f"django-anymail/{ANYMAIL_VERSION}"
+        )
+        self.assertNotIn("Idempotency-Key", ask["headers"])
+        self.assertEqual(
+            self.get_api_call_headers()["Idempotency-Key"], "order-981-shipped"
+        )
+
+    def test_uploads_bytes_with_given_headers_and_no_key(self):
+        self.fake_posthog()
+        self.message.send()
+        invoice_upload = self.calls(STORAGE_URL)[0]
+        self.assertEqual(invoice_upload["method"], "PUT")
+        self.assertEqual(
+            invoice_upload["url"],
+            f"{STORAGE_URL}{sha256_hex(INVOICE)}?X-Amz-Signature=abc",
+        )
+        self.assertEqual(invoice_upload["data"], INVOICE)
+        self.assertEqual(
+            invoice_upload["headers"],
+            upload_slot({"sha256": sha256_hex(INVOICE), "size": len(INVOICE)})[
+                "headers"
+            ],
+        )
+        self.assertIs(invoice_upload["allow_redirects"], False)
+
+    def test_present_file_is_not_uploaded(self):
+        self.fake_posthog(present={sha256_hex(INVOICE)})
+        self.message.send()
+        self.assertEqual(
+            [call["url"].split("?")[0] for call in self.calls(STORAGE_URL)],
+            [STORAGE_URL + sha256_hex(LOGO)],
+        )
+        self.assertEqual(len(self.get_api_call_json()["attachments"]), 2)
+
+    def test_same_bytes_twice_upload_once(self):
+        self.fake_posthog()
+        self.message.attach("invoice-copy.pdf", INVOICE, "application/pdf")
+        self.message.send()
+        (ask,) = self.calls(UPLOADS_URL)
+        self.assertEqual(len(json.loads(ask["data"])["files"]), 2)
+        self.assertEqual(len(self.calls(STORAGE_URL)), 2)
+        attachments = self.get_api_call_json()["attachments"]
+        self.assertEqual(
+            [att["filename"] for att in attachments],
+            ["invoice.pdf", "logo.png", "invoice-copy.pdf"],
+        )
+        self.assertEqual(attachments[2]["sha256"], sha256_hex(INVOICE))
+
+    def test_no_attachments_skip_the_upload_route(self):
+        self.fake_posthog()
+        self.message.attachments = []
+        self.message.send()
+        self.assertEqual(self.calls(UPLOADS_URL), [])
+        self.assertNotIn("attachments", self.get_api_call_json())
+
+    @override_settings(ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True)
+    def test_ignored_template_attachments_are_not_uploaded(self):
+        self.fake_posthog()
+        message = AnymailMessage(to=["ana@example.com"], template_id=TEMPLATE_ID)
+        message.from_email = None
+        message.attach("invoice.pdf", INVOICE, "application/pdf")
+        message.send()
+        self.assertEqual(self.calls(UPLOADS_URL), [])
+        self.assertEqual(
+            self.get_api_call_json(),
+            {"to": "ana@example.com", "template_id": TEMPLATE_ID},
+        )
+
+    def assert_upload_error(self, code, *, status, retryable, attr, retry_after=None):
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        error = cm.exception
+        self.assertEqual(error.status_code, status)
+        self.assertEqual(error.code, code)
+        self.assertEqual(error.attr, attr)
+        self.assertIs(error.retryable, retryable)
+        self.assertEqual(error.retry_after, retry_after)
+        self.assert_not_sent()
+        return error
+
+    def test_upload_route_refusal_names_the_attachment(self):
+        self.fake_posthog(
+            uploads=self.response(
+                400,
+                {
+                    "type": "invalid_request",
+                    "code": "message_too_large",
+                    "detail": "Too large",
+                    "attr": "files__1__size",
+                },
+            )
+        )
+        self.assert_upload_error(
+            "message_too_large", status=400, retryable=False, attr="attachments__1"
+        )
+        self.assertEqual(self.calls(STORAGE_URL), [])
+
+    def test_upload_route_names_first_attachment_of_a_shared_file(self):
+        self.message.attachments = []
+        self.message.attach("logo.png", LOGO, "image/png")
+        self.message.attach("invoice.pdf", INVOICE, "application/pdf")
+        self.message.attach("logo-again.png", LOGO, "image/png")
+        self.message.attach("terms.pdf", b"%PDF terms", "application/pdf")
+        self.fake_posthog(
+            uploads=self.response(
+                400, {"code": "message_too_large", "attr": "files__2__size"}
+            )
+        )
+        self.assert_upload_error(
+            "message_too_large", status=400, retryable=False, attr="attachments__3"
+        )
+
+    def test_daily_upload_quota_is_not_retryable(self):
+        self.fake_posthog(
+            uploads=self.response(
+                429,
+                {"code": "upload_quota_exceeded", "attr": None},
+                headers={"Retry-After": "3600"},
+            )
+        )
+        self.assert_upload_error(
+            "upload_quota_exceeded", status=429, retryable=False, attr="attachments"
+        )
+
+    def test_upload_route_missing(self):
+        self.fake_posthog(uploads=self.response(404, {"detail": "Not found."}))
+        self.assert_upload_error(
+            "not_found", status=404, retryable=False, attr="attachments"
+        )
+
+    def test_upload_route_unavailable_is_retryable(self):
+        self.fake_posthog(
+            uploads=self.response(503, {"code": "delivery_unavailable", "attr": None})
+        )
+        self.assert_upload_error(
+            "delivery_unavailable", status=503, retryable=True, attr="attachments"
+        )
+
+    def test_upload_route_unreachable_is_retryable(self):
+        def request(session, method, url, **kwargs):
+            raise requests.ConnectionError("unreachable")
+
+        self.mock_request.side_effect = request
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        self.assertIs(cm.exception.retryable, True)
+        self.assertIsNone(cm.exception.status_code)
+        self.assertEqual(self.mock_request.call_count, 1)
+
+    def test_upload_answer_without_a_slot_per_file(self):
+        for answer in [
+            {},
+            {"files": []},
+            {"files": [{"sha256": "0" * 64, "status": "present"}] * 2},
+            {"files": [{"status": "upload"}, {"status": "upload"}]},
+        ]:
+            with self.subTest(answer=answer):
+                self.mock_request.reset_mock()
+                self.fake_posthog(uploads=self.response(200, answer))
+                with self.assertRaisesMessage(AnymailAPIError, "upload") as cm:
+                    self.message.send()
+                self.assertIs(cm.exception.retryable, False)
+                self.assertEqual(self.calls(STORAGE_URL), [])
+                self.assert_not_sent()
+
+    def test_refuses_plain_http_upload_url(self):
+        slot = upload_slot({"sha256": sha256_hex(INVOICE), "size": len(INVOICE)})
+        slot["url"] = "http://attachments.example.com/upload"
+        self.fake_posthog(
+            uploads=self.response(
+                200,
+                {
+                    "files": [
+                        slot,
+                        present_slot({"sha256": sha256_hex(LOGO)}),
+                    ]
+                },
+            )
+        )
+        with self.assertRaisesMessage(AnymailAPIError, "https") as cm:
+            self.message.send()
+        self.assertIs(cm.exception.retryable, False)
+        self.assertEqual(cm.exception.attr, "attachments__0")
+        self.assertEqual(self.calls("http://attachments.example.com"), [])
+        self.assert_not_sent()
+
+    def test_storage_refusal_is_not_retryable(self):
+        self.fake_posthog(
+            storage=self.response(
+                403,
+                raw=b"<Error><Code>SignatureDoesNotMatch</Code>"
+                b"<Message>The request signature does not match</Message></Error>",
+            )
+        )
+        error = self.assert_upload_error(
+            "attachment_upload_failed",
+            status=403,
+            retryable=False,
+            attr="attachments__0",
+        )
+        self.assertEqual(error.detail, "The request signature does not match")
+        self.assertEqual(len(self.calls(STORAGE_URL)), 1)
+
+    def test_storage_fault_is_retryable(self):
+        self.fake_posthog(
+            storage=self.response(503, raw=b"", headers={"Retry-After": "2"})
+        )
+        self.assert_upload_error(
+            "attachment_upload_failed",
+            status=503,
+            retryable=True,
+            attr="attachments__0",
+            retry_after=2,
+        )
+
+    def test_storage_redirect_is_a_failed_upload(self):
+        self.fake_posthog(
+            storage=self.response(307, headers={"Location": "https://elsewhere/"})
+        )
+        self.assert_upload_error(
+            "attachment_upload_failed",
+            status=307,
+            retryable=False,
+            attr="attachments__0",
+        )
+
+    def test_storage_unreachable_is_retryable(self):
+        self.fake_posthog(storage=requests.ConnectionError("blocked by firewall"))
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        error = cm.exception
+        self.assertIsNone(error.status_code)
+        self.assertEqual(error.code, "attachment_upload_failed")
+        self.assertEqual(error.attr, "attachments__0")
+        self.assertIs(error.retryable, True)
+        self.assert_not_sent()
+
+    def test_secret_key_never_goes_to_storage(self):
+        self.fake_posthog()
+        self.message.send()
+        for upload in self.calls(STORAGE_URL):
+            self.assertNotIn("phs_test_secret_key", json.dumps(upload["headers"]))
+            self.assertIsNone(upload.get("auth"))
+
+
+@tag("posthog")
+@override_settings(
+    MAILERS={
+        "default": {
+            "BACKEND": "anymail.backends.posthog.EmailBackend",
+            "OPTIONS": {**POSTHOG_BASE_OPTIONS, "api_url": "http://localhost:8010"},
+        },
+    },
+)
+class PostHogLocalUploadTests(PostHogBackendMockAPITestCase):
+    def test_plain_http_upload_url_allowed_for_plain_http_host(self):
+        local_storage = "http://localhost:19000/attachments/"
+
+        def request(session, method, url, **kwargs):
+            if url.endswith("/attachments/uploads/"):
+                slot = upload_slot({"sha256": sha256_hex(INVOICE), "size": 8})
+                slot["url"] = local_storage + sha256_hex(INVOICE)
+                return self.response(200, {"files": [slot]})
+            if url.startswith(local_storage):
+                return self.response(200)
+            return self.response(202, json.loads(self.DEFAULT_RAW_RESPONSE))
+
+        self.mock_request.side_effect = request
+        self.message.attach("invoice.pdf", INVOICE, "application/pdf")
+        self.message.send()
+        self.assertEqual(len(self.calls(local_storage)), 1)
+        self.assertEqual(self.message.anymail_status.status, {"queued"})
 
 
 @tag("posthog")

@@ -84,9 +84,11 @@ PostHog's send options ride in the message's
         "template_key": "order-shipped",
         # Make retries safe; sent as the Idempotency-Key header:
         "idempotency_key": "order-981-shipped",
+        # Mark an email that carries login links, reset tokens or codes:
+        "sensitive": True,
     }
 
-``template_key`` takes letters, numbers, hyphens and underscores, up to 400 characters.
+``template_key`` takes letters, numbers, hyphens and underscores, up to 256 characters.
 To use one key for every message, set it in Anymail's
 :ref:`global send defaults <send-defaults>`:
 
@@ -99,8 +101,15 @@ To use one key for every message, set it in Anymail's
         },
     }
 
+A ``sensitive`` email keeps its links as they are unless
+:attr:`~anymail.message.AnymailMessage.track_clicks` is ``True``, and PostHog leaves its
+subject off engagement events and its content out of logs. Without ``sensitive``,
+PostHog uses its own default.
+
 Any other ``esp_extra`` keys are merged into the JSON that Anymail sends to PostHog's
-API, so you can use API fields Anymail doesn't know about yet.
+API, so you can use API fields Anymail doesn't know about yet. A dict merges into the
+field Anymail builds, so ``{"tracking": {"engagement": False}}`` turns off PostHog's
+engagement events and keeps ``track_opens`` and ``track_clicks``.
 
 
 .. _posthog-quirks:
@@ -132,11 +141,26 @@ parts and send anyway---see :ref:`unsupported-features`.
   :attr:`~anymail.message.AnymailMessage.metadata`, or
   :attr:`~anymail.message.AnymailMessage.send_at`.
 
-**One engagement setting**
-  PostHog captures opens and clicks together, with its ``capture_engagement`` option.
+**Click tracking needs open tracking**
   :attr:`~anymail.message.AnymailMessage.track_opens` and
-  :attr:`~anymail.message.AnymailMessage.track_clicks` set it when only one is set or
-  both agree; different values are unsupported.
+  :attr:`~anymail.message.AnymailMessage.track_clicks` set PostHog's
+  ``tracking.opens`` and ``tracking.clicks``. A message that leaves one unset gets
+  PostHog's default for it: opens are tracked, and clicks are tracked unless the email
+  is ``sensitive``. ``track_clicks=True`` with ``track_opens=False`` is unsupported,
+  because PostHog counts clicks only on emails it tracks opens for.
+
+**Attachments upload first**
+  PostHog takes an email's files before the email. For a message with attachments,
+  Anymail sends each file's SHA-256 and size to PostHog's upload route, uploads the
+  files PostHog doesn't have yet to the URLs it answers, then sends the email naming
+  each file by its SHA-256. The same bytes in two attachments upload once, and a file
+  your project uploaded recently uploads nothing. The upload goes to Amazon S3, not to
+  your PostHog host: if your servers limit outgoing traffic, allow HTTPS to the
+  upload host, a host that ends in ``.s3.us-east-1.amazonaws.com`` for US Cloud or
+  ``.s3.eu-central-1.amazonaws.com`` for EU Cloud. Anymail never sends your secret key
+  to the upload host, and refuses an upload URL that isn't https unless
+  ``POSTHOG_API_URL`` is plain http too, as in local
+  development. A failed upload sends no email.
 
 **Attachment types have no parameters**
   PostHog takes an attachment's MIME type without parameters such as ``charset``,
@@ -191,10 +215,10 @@ Django fills in ``DEFAULT_FROM_EMAIL``, set ``from_email`` to ``None``:
     message.from_email = None  # use the template's sender
     message.send()
 
-A template send leaves out ``template_key``, ``capture_engagement``,
-:attr:`~anymail.message.AnymailMessage.track_opens` and
-:attr:`~anymail.message.AnymailMessage.track_clicks`, so defaults you set for rendered
-sends don't break template sends.
+A template send leaves out ``template_key``, ``tracking``, ``sensitive``,
+``capture_engagement``, :attr:`~anymail.message.AnymailMessage.track_opens` and
+:attr:`~anymail.message.AnymailMessage.track_clicks`, because the template uses its
+own settings. Defaults you set for rendered sends don't break template sends.
 
 PostHog doesn't support batch sending, so
 :attr:`~anymail.message.AnymailMessage.merge_data` is unsupported.
@@ -214,6 +238,19 @@ plus ``retryable`` and ``retry_after``:
   being sent), or a 429 for throttling.
 * ``retry_after`` is the number of seconds PostHog asked you to wait, for a throttled
   429.
+
+A message with attachments can also fail before the send, and then PostHog sends
+nothing:
+
+* ``code`` ``"attachment_upload_failed"``: PostHog's file storage refused an upload or
+  didn't answer. ``attr`` names the attachment, such as ``"attachments__0"``, and
+  ``detail`` carries the storage's reason. It is ``retryable`` when the storage was
+  unreachable or answered a passing fault; a retry asks for a fresh upload URL.
+* ``code`` ``"upload_quota_exceeded"`` (a 429): your project uploaded all the file bytes
+  it can today. It is not ``retryable``; files PostHog already has don't count.
+* Any other refusal of the upload route, such as ``"message_too_large"`` or
+  ``"not_found"`` (this PostHog version or project can't take files), carries
+  PostHog's ``code``, with ``attr`` naming the attachment when PostHog names a file.
 
 A 503 or a network error can still deliver the email. Retrying without the same
 ``idempotency_key`` may send it twice. If you send through a task queue that retries,

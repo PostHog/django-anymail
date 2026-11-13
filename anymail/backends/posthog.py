@@ -1,12 +1,25 @@
+import hashlib
 import re
+from dataclasses import dataclass
+from urllib.parse import urljoin
+
+import requests
 
 from .._version import __version__
 from ..exceptions import AnymailRequestsAPIError
 from ..message import AnymailRecipientStatus
-from ..utils import get_anymail_setting
+from ..utils import get_anymail_setting, update_deep
 from .base_requests import AnymailRequestsBackend, RequestsPayload
 
-TEMPLATE_KEY_PATTERN = re.compile(r"[a-zA-Z0-9_-]{1,400}")
+TEMPLATE_KEY_MAX_LENGTH = 256
+TEMPLATE_KEY_PATTERN = re.compile(rf"[a-zA-Z0-9_-]{{1,{TEMPLATE_KEY_MAX_LENGTH}}}")
+
+SEND_ENDPOINT = "api/projects/@current/messaging/send/email/"
+UPLOADS_ENDPOINT = "api/projects/@current/messaging/attachments/uploads/"
+
+NOT_RETRYABLE_429_CODES = {"quota_limited", "upload_quota_exceeded"}
+STORAGE_RETRY_STATUSES = {429, 500, 502, 503, 504}
+STORAGE_ERROR_MESSAGE = re.compile(r"<Message>([^<]{1,500})</Message>")
 
 AUTOMATIC_HEADERS = {"message-id", "date", "mime-version", "x-mailer"}
 
@@ -21,7 +34,7 @@ RENDERED_CONTENT_FIELDS = (
     "attachments",
 )
 
-RENDERED_ONLY_OPTIONS = ("template_key", "capture_engagement")
+RENDERED_ONLY_OPTIONS = ("template_key", "capture_engagement", "tracking", "sensitive")
 
 
 def is_automatic_header(name):
@@ -66,11 +79,144 @@ class EmailBackend(AnymailRequestsBackend):
         return PostHogPayload(message, defaults, self)
 
     def post_to_esp(self, payload, message):
+        files = payload.files_to_upload()
+        if files:
+            for upload in self.ask_where_to_upload(files, payload, message):
+                self.upload(upload, payload, message)
         try:
             return super().post_to_esp(payload, message)
         except AnymailRequestsAPIError as error:
             describe_api_error(error)
             raise
+
+    def ask_where_to_upload(self, files, payload, message):
+        """
+        POST each file's hash and size to PostHog's upload route, and return
+        the files PostHog doesn't have yet with where to upload them.
+        """
+        headers = dict(payload.headers)
+        headers.pop("Idempotency-Key", None)
+        body = {"files": [{"sha256": file.sha256, "size": file.size} for file in files]}
+        try:
+            response = self.session.request(
+                method="POST",
+                url=urljoin(self.api_url, UPLOADS_ENDPOINT),
+                data=payload.serialize_json(body),
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as err:
+            error = request_error(
+                "Error asking PostHog where to upload",
+                err,
+                email_message=message,
+                payload=payload,
+                backend=self,
+            )
+            describe_api_error(error)
+            raise error from err
+        if not 200 <= response.status_code < 300:
+            error = AnymailRequestsAPIError(
+                email_message=message, payload=payload, response=response, backend=self
+            )
+            describe_api_error(error)
+            if response.status_code == 404 and error.code is None:
+                error.code = "not_found"
+            error.attr = attachment_field(error.attr, files)
+            raise error
+        return self.parse_upload_slots(response, files, payload, message)
+
+    def parse_upload_slots(self, response, files, payload, message):
+        body = parse_error_body(response)
+        slots = body.get("files")
+        if not isinstance(slots, list) or len(slots) != len(files):
+            raise self.invalid_upload_answer(response, payload, message)
+        uploads = []
+        for slot, file in zip(slots, files):
+            if not isinstance(slot, dict) or slot.get("sha256") != file.sha256:
+                raise self.invalid_upload_answer(response, payload, message)
+            if slot.get("status") == "present":
+                continue
+            url, method, headers = (
+                slot.get("url"),
+                slot.get("method"),
+                slot.get("headers"),
+            )
+            if not (
+                slot.get("status") == "upload"
+                and isinstance(url, str)
+                and isinstance(method, str)
+                and isinstance(headers, dict)
+                and all(isinstance(value, str) for value in headers.values())
+            ):
+                raise self.invalid_upload_answer(response, payload, message)
+            if not url.lower().startswith(
+                "https://"
+            ) and not self.api_url.lower().startswith("http://"):
+                error = AnymailRequestsAPIError(
+                    f"PostHog answered an upload URL that isn't https for"
+                    f" attachment {file.attachment_index}, so Anymail uploaded nothing",
+                    email_message=message,
+                    payload=payload,
+                    response=response,
+                    backend=self,
+                )
+                describe_api_error(error)
+                error.retryable = False
+                error.attr = f"attachments__{file.attachment_index}"
+                raise error
+            uploads.append(
+                PostHogUpload(file=file, url=url, method=method, headers=headers)
+            )
+        return uploads
+
+    def invalid_upload_answer(self, response, payload, message):
+        error = AnymailRequestsAPIError(
+            "Invalid PostHog upload route response: no upload slot for each file",
+            email_message=message,
+            payload=payload,
+            response=response,
+            backend=self,
+        )
+        describe_api_error(error)
+        error.retryable = False
+        return error
+
+    def upload(self, upload, payload, message):
+        """
+        Send a file's bytes to PostHog's file storage, with exactly the headers
+        PostHog gave and without the secret key.
+        """
+        index = upload.file.attachment_index
+        try:
+            response = self.session.request(
+                method=upload.method,
+                url=upload.url,
+                data=upload.file.content,
+                headers=upload.headers,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException as err:
+            error = request_error(
+                f"Error uploading attachment {index} to PostHog's file storage",
+                err,
+                email_message=message,
+                payload=payload,
+                backend=self,
+            )
+            describe_storage_error(error, index)
+            raise error from err
+        if not 200 <= response.status_code < 300:
+            error = AnymailRequestsAPIError(
+                f"PostHog's file storage refused attachment {index}, so Anymail sent no email",
+                email_message=message,
+                payload=payload,
+                response=response,
+                backend=self,
+            )
+            describe_storage_error(error, index)
+            raise error
 
     def parse_recipient_status(self, response, payload, message):
         try:
@@ -99,6 +245,33 @@ class EmailBackend(AnymailRequestsBackend):
         return message_id
 
 
+@dataclass(frozen=True)
+class PostHogFile:
+    sha256: str
+    content: bytes
+    attachment_index: int
+
+    @property
+    def size(self):
+        return len(self.content)
+
+
+@dataclass(frozen=True)
+class PostHogUpload:
+    file: PostHogFile
+    url: str
+    method: str
+    headers: dict
+
+
+def request_error(description, err, **kwargs):
+    """An error that is both AnymailRequestsAPIError and err's requests type"""
+    error_class = type(
+        "AnymailRequestsAPIError", (AnymailRequestsAPIError, type(err)), {}
+    )
+    return error_class(description, **kwargs)
+
+
 def describe_api_error(error):
     """
     Add the PostHog error's code, detail and attr to an AnymailRequestsAPIError,
@@ -113,11 +286,40 @@ def describe_api_error(error):
     if response is None:
         error.retryable = True
     elif response.status_code == 429:
-        error.retryable = error.code != "quota_limited"
+        error.retryable = error.code not in NOT_RETRYABLE_429_CODES
         if error.retryable:
             error.retry_after = parse_retry_after(response)
     else:
         error.retryable = response.status_code in (409, 503)
+
+
+def describe_storage_error(error, attachment_index):
+    """
+    Describe a failed upload to PostHog's file storage. A retry of the send asks
+    for a fresh upload URL, so a passing fault is retryable.
+    """
+    response = error.response
+    error.code = "attachment_upload_failed"
+    error.attr = f"attachments__{attachment_index}"
+    error.detail = None
+    error.retry_after = None
+    if response is None:
+        error.retryable = True
+        return
+    found = STORAGE_ERROR_MESSAGE.search(response.text or "")
+    error.detail = found.group(1) if found else None
+    error.retryable = response.status_code in STORAGE_RETRY_STATUSES
+    if error.retryable:
+        error.retry_after = parse_retry_after(response)
+
+
+def attachment_field(attr, files):
+    """Name the attachment behind the upload route's files__<n> attr"""
+    if isinstance(attr, str) and attr.startswith("files__"):
+        index = attr.split("__")[1]
+        if index.isdigit() and int(index) < len(files):
+            return f"attachments__{files[int(index)].attachment_index}"
+    return "attachments"
 
 
 def parse_error_body(response):
@@ -141,12 +343,17 @@ class PostHogPayload(RequestsPayload):
         self.from_email = None
         self.track_opens = None
         self.track_clicks = None
+        self.files_by_sha256 = {}
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {backend.secret_key}"
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
         headers["X-PostHog-Integration"] = f"django-anymail/{__version__}"
         super().__init__(message, defaults, backend, headers=headers, *args, **kwargs)
+        if "template_id" in self.data:
+            self.check_template_form()
+        else:
+            self.finish_rendered_form()
 
     @property
     def recipients(self):
@@ -158,14 +365,17 @@ class PostHogPayload(RequestsPayload):
             for email in emails
         ]
 
+    def files_to_upload(self):
+        """Each file the request names, once, in the order it first appears"""
+        sha256s = dict.fromkeys(
+            att["sha256"] for att in self.data.get("attachments", [])
+        )
+        return [self.files_by_sha256[sha256] for sha256 in sha256s]
+
     def get_api_endpoint(self):
-        return "api/projects/@current/messaging/send/email/"
+        return SEND_ENDPOINT
 
     def serialize_data(self):
-        if "template_id" in self.data:
-            self.check_template_form()
-        else:
-            self.finish_rendered_form()
         return self.serialize_json(self.data)
 
     def check_template_form(self):
@@ -184,19 +394,22 @@ class PostHogPayload(RequestsPayload):
         if "message_data" in self.data:
             self.unsupported_feature("merge_global_data without template_id")
             del self.data["message_data"]
-        capture_engagement = self.capture_engagement()
-        if capture_engagement is not None:
-            self.data.setdefault("capture_engagement", capture_engagement)
+        tracking = self.data.get("tracking")
+        if isinstance(tracking, dict) and "capture_engagement" in self.data:
+            # PostHog refuses capture_engagement beside tracking.
+            tracking.setdefault("engagement", self.data.pop("capture_engagement"))
         self.data.setdefault("template_key", "django-anymail")
 
-    def capture_engagement(self):
-        tracking = {self.track_opens, self.track_clicks} - {None}
-        if len(tracking) > 1:
-            self.unsupported_feature(
-                "track_opens and track_clicks set to different values"
-            )
-            return None
-        return tracking.pop() if tracking else None
+    def tracking(self):
+        tracking = {}
+        if self.track_opens is not None:
+            tracking["opens"] = self.track_opens
+        if self.track_clicks is not None:
+            tracking["clicks"] = self.track_clicks
+        if tracking.get("clicks") and tracking.get("opens") is False:
+            self.unsupported_feature("track_clicks without track_opens")
+            del tracking["clicks"]
+        return tracking
 
     def init_payload(self):
         self.data = {}
@@ -245,11 +458,16 @@ class PostHogPayload(RequestsPayload):
         if body:
             self.data["html"] = body
 
-    def make_attachment(self, attachment):
+    def make_attachment(self, index, attachment):
+        content = attachment.content
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        sha256 = hashlib.sha256(content).hexdigest()
+        self.files_by_sha256.setdefault(sha256, PostHogFile(sha256, content, index))
         att = {
+            "sha256": sha256,
             "filename": attachment.name,
             "content_type": attachment.mimetype,
-            "content": attachment.b64content_utf8,
         }
         if attachment.inline:
             if not attachment.cid:
@@ -261,7 +479,8 @@ class PostHogPayload(RequestsPayload):
     def set_attachments(self, attachments):
         if attachments:
             self.data["attachments"] = [
-                self.make_attachment(attachment) for attachment in attachments
+                self.make_attachment(index, attachment)
+                for index, attachment in enumerate(attachments)
             ]
 
     def set_envelope_sender(self, email):
@@ -272,9 +491,16 @@ class PostHogPayload(RequestsPayload):
 
     def set_track_opens(self, track_opens):
         self.track_opens = track_opens
+        self.set_tracking()
 
     def set_track_clicks(self, track_clicks):
         self.track_clicks = track_clicks
+        self.set_tracking()
+
+    def set_tracking(self):
+        tracking = self.tracking()
+        if tracking:
+            self.data["tracking"] = tracking
 
     def set_template_id(self, template_id):
         self.data["template_id"] = template_id
@@ -291,7 +517,7 @@ class PostHogPayload(RequestsPayload):
         if template_key is not None and not is_valid_template_key(template_key):
             self.unsupported_feature(
                 f"template_key {template_key!r} (use letters, numbers,"
-                " hyphens and underscores, at most 400)"
+                f" hyphens and underscores, at most {TEMPLATE_KEY_MAX_LENGTH})"
             )
             del extra["template_key"]
-        self.data.update(extra)
+        update_deep(self.data, extra)
