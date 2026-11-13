@@ -108,6 +108,7 @@ class EmailBackend(AnymailRequestsBackend):
                 url=urljoin(self.api_url, UPLOADS_ENDPOINT),
                 data=payload.serialize_json(body),
                 headers=headers,
+                auth=payload.auth,
                 timeout=self.timeout,
             )
         except requests.RequestException as err:
@@ -379,17 +380,38 @@ def unnamed_file(mimetype):
     return f"attachment{mimetypes.guess_extension(mimetype) or ''}"
 
 
+class SecretKeyAuth(requests.auth.AuthBase):
+    """
+    The secret key as requests auth, so a .netrc login for the PostHog host
+    can't replace it.
+    """
+
+    def __init__(self, secret_key):
+        self.secret_key = secret_key
+
+    def __call__(self, request):
+        request.headers["Authorization"] = f"Bearer {self.secret_key}"
+        return request
+
+
 class PostHogPayload(RequestsPayload):
     def __init__(self, message, defaults, backend, *args, **kwargs):
         self.recipients_by_field = {}
         self.from_email = None
         self.files_by_sha256 = {}
         headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {backend.secret_key}"
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
         headers["X-PostHog-Integration"] = f"django-anymail/{__version__}"
-        super().__init__(message, defaults, backend, headers=headers, *args, **kwargs)
+        super().__init__(
+            message,
+            defaults,
+            backend,
+            headers=headers,
+            auth=SecretKeyAuth(backend.secret_key),
+            *args,
+            **kwargs,
+        )
         if "template_id" in self.data:
             self.check_template_form()
         else:

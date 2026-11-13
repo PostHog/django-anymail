@@ -675,9 +675,6 @@ class PostHogSendTests(PostHogBackendMockAPITestCase):
                 "template_key": "django-anymail",
             }
         )
-        self.assertEqual(
-            self.get_api_call_headers()["Authorization"], "Bearer phs_test_secret_key"
-        )
 
     def test_without_from_email_uses_project_sender(self):
         self.message.from_email = None
@@ -763,7 +760,6 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
                 ]
             },
         )
-        self.assertEqual(ask["headers"]["Authorization"], "Bearer phs_test_secret_key")
         self.assertEqual(
             ask["headers"]["X-PostHog-Integration"], f"django-anymail/{ANYMAIL_VERSION}"
         )
@@ -1090,6 +1086,33 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
         uploads = self.calls(STORAGE_URL)
         self.assertEqual(len(uploads), 2)
         for upload in uploads:
+            self.assertNotIn("Authorization", upload["headers"])
+
+    def test_netrc_entry_for_posthog_keeps_the_secret_key(self):
+        # requests would replace a hand-set Authorization header with a
+        # matching .netrc login.
+        self.patch_request.stop()
+
+        def upload_route(request):
+            files = json.loads(request.body)["files"]
+            return 200, {}, json.dumps({"files": [upload_slot(f) for f in files]})
+
+        self.storage.add_callback(responses.POST, UPLOADS_URL, callback=upload_route)
+        self.storage.add(
+            responses.POST, SEND_URL, body=self.DEFAULT_RAW_RESPONSE, status=202
+        )
+        with tempfile.TemporaryDirectory() as home:
+            netrc = os.path.join(home, ".netrc")
+            with open(netrc, "w") as file:
+                file.write("machine us.posthog.com login user password netrc-pw\n")
+            with patch.dict(os.environ, {"NETRC": netrc}):
+                self.message.send()
+        for url in (UPLOADS_URL, SEND_URL):
+            (call,) = self.calls(url)
+            self.assertEqual(
+                call["headers"]["Authorization"], "Bearer phs_test_secret_key"
+            )
+        for upload in self.calls(STORAGE_URL):
             self.assertNotIn("Authorization", upload["headers"])
 
     def test_esp_extra_attachment_reference_sends_without_upload(self):
