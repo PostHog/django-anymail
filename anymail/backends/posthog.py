@@ -1,4 +1,5 @@
 import hashlib
+import mimetypes
 import re
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -19,6 +20,7 @@ UPLOADS_ENDPOINT = "api/projects/@current/messaging/attachments/uploads/"
 
 NOT_RETRYABLE_429_CODES = {"quota_limited", "upload_quota_exceeded"}
 STORAGE_RETRY_STATUSES = {429, 500, 502, 503, 504}
+STORAGE_URL_EXPIRED = "Request has expired"
 STORAGE_ERROR_MESSAGE = re.compile(r"<Message>([^<]{1,500})</Message>")
 
 AUTOMATIC_HEADERS = {"message-id", "date", "mime-version", "x-mailer"}
@@ -248,7 +250,7 @@ class EmailBackend(AnymailRequestsBackend):
             describe_api_error(error)
             raise
         status = AnymailRecipientStatus(message_id=message_id, status="queued")
-        return {email.addr_spec: status for email in payload.recipients}
+        return {email: status for email in payload.recipients}
 
     def parse_message_id(self, response, payload, message):
         parsed_response = self.deserialize_json_response(response, payload, message)
@@ -307,7 +309,7 @@ def describe_api_error(error):
     error.attr = body.get("attr")
     error.retry_after = None
     if response is None:
-        error.retryable = True
+        error.retryable = could_not_reach(error)
     elif response.status_code == 429:
         error.retryable = error.code not in NOT_RETRYABLE_429_CODES
         if error.retryable:
@@ -327,13 +329,21 @@ def describe_storage_error(error, attachment_index):
     error.detail = None
     error.retry_after = None
     if response is None:
-        error.retryable = True
+        error.retryable = could_not_reach(error)
         return
     found = STORAGE_ERROR_MESSAGE.search(response.text or "")
     error.detail = found.group(1) if found else None
-    error.retryable = response.status_code in STORAGE_RETRY_STATUSES
+    error.retryable = (
+        response.status_code in STORAGE_RETRY_STATUSES
+        or error.detail == STORAGE_URL_EXPIRED
+    )
     if error.retryable:
         error.retry_after = parse_retry_after(response)
+
+
+def could_not_reach(error):
+    """A request that never got an answer, which the same send may retry"""
+    return isinstance(error, (requests.ConnectionError, requests.Timeout))
 
 
 def attachment_field(attr, files):
@@ -360,6 +370,11 @@ def parse_retry_after(response):
         return None
 
 
+def unnamed_file(mimetype):
+    """A file name for an attachment without one, which PostHog requires"""
+    return f"attachment{mimetypes.guess_extension(mimetype) or ''}"
+
+
 class PostHogPayload(RequestsPayload):
     def __init__(self, message, defaults, backend, *args, **kwargs):
         self.recipients_by_field = {}
@@ -378,13 +393,17 @@ class PostHogPayload(RequestsPayload):
 
     @property
     def recipients(self):
-        """The recipients the request carries, for parse_recipient_status"""
-        return [
-            email
-            for field, emails in self.recipients_by_field.items()
-            if field in self.data
-            for email in emails
-        ]
+        """The addresses the request carries, for parse_recipient_status"""
+        addresses = []
+        for field in ("to", "cc", "bcc"):
+            sent = self.data.get(field) or []
+            sent = [sent] if isinstance(sent, str) else sent
+            given = self.recipients_by_field.get(field, [])
+            if sent == self.bare_addresses(given):
+                addresses += [email.addr_spec for email in given]
+            else:
+                addresses += [email for email in sent if isinstance(email, str)]
+        return addresses
 
     def files_to_upload(self):
         """Each file the request names, once, in the order it first appears"""
@@ -502,14 +521,12 @@ class PostHogPayload(RequestsPayload):
             self.data["html"] = body
 
     def make_attachment(self, index, attachment):
-        content = attachment.content
-        if isinstance(content, str):
-            content = content.encode("utf-8")
+        content = attachment.content_utf8_bytes
         sha256 = hashlib.sha256(content).hexdigest()
         self.files_by_sha256.setdefault(sha256, PostHogFile(sha256, content, index))
         att = {
             "sha256": sha256,
-            "filename": attachment.name,
+            "filename": attachment.name or unnamed_file(attachment.mimetype),
             "content_type": attachment.mimetype,
         }
         if attachment.inline:

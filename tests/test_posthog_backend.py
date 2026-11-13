@@ -1,5 +1,8 @@
 import hashlib
 import json
+import os
+import re
+import tempfile
 from base64 import b64decode, b64encode
 from datetime import datetime, timezone
 from email.message import MIMEPart
@@ -8,6 +11,7 @@ from unittest.mock import patch
 
 import django
 import requests
+import responses
 from django.core import mail
 from django.test import SimpleTestCase, tag
 
@@ -20,19 +24,12 @@ from anymail.exceptions import (
 )
 from anymail.message import AnymailMessage
 
-from .mock_requests_backend import (
-    RequestsBackendMockAPITestCase,
-    SessionSharingTestCases,
-)
+from .mock_requests_backend import RequestsBackendMockAPITestCase
 from .utils import (
     AnymailTestMixin,
     create_text_attachment,
     override_settings,
 )
-
-# requests' own Session.request, kept before the tests patch it, so a storage
-# upload goes through requests' real header, auth and netrc merging.
-REAL_SESSION_REQUEST = requests.Session.request
 
 POSTHOG_BASE_OPTIONS = {"secret_key": "phs_test_secret_key"}
 SEND_URL = "https://us.posthog.com/api/projects/@current/messaging/send/email/"
@@ -122,29 +119,21 @@ class PostHogBackendMockAPITestCase(RequestsBackendMockAPITestCase):
         self.message = self.order_shipped()
         # File storage is faked at the transport, so a test sees the upload
         # exactly as the storage host would.
-        self.patch_send = patch("requests.adapters.HTTPAdapter.send", autospec=True)
-        self.mock_send = self.patch_send.start()
-        self.addCleanup(self.patch_send.stop)
+        self.storage = responses.RequestsMock(assert_all_requests_are_fired=False)
+        self.storage.add_callback(
+            responses.PUT, re.compile(r"https?://.*"), callback=self.answer_storage
+        )
+        self.storage.start()
+        self.addCleanup(self.storage.stop)
         self.storage_answer = None
-        self.mock_send.side_effect = self.answer_storage
         self.urls_in_order = []
 
-    def answer_storage(self, adapter, prepared, **kwargs):
-        self.urls_in_order.append(prepared.url)
-        if isinstance(self.storage_answer, Exception):
-            raise self.storage_answer
+    def answer_storage(self, request):
+        self.urls_in_order.append(request.url)
         answer = self.storage_answer
-        if answer is None:
-            answer = self.response(200)
-        # A transport answer, which requests then handles like a real one.
-        response = requests.Response()
-        response.status_code = answer.status_code
-        response.reason = answer.reason
-        response.headers.update(answer.headers)
-        response._content = answer.content
-        response.url = prepared.url
-        response.request = prepared
-        return response
+        if answer is None or isinstance(answer, Exception):
+            return answer or (200, {}, b"")
+        return answer.status_code, dict(answer.headers), answer.content
 
     @staticmethod
     def order_shipped(**kwargs):
@@ -209,7 +198,7 @@ class PostHogBackendMockAPITestCase(RequestsBackendMockAPITestCase):
                 return self.response(200, {"files": slots})
             if url == SEND_URL:
                 return self.response(202, json.loads(self.DEFAULT_RAW_RESPONSE))
-            return REAL_SESSION_REQUEST(session, method, url, **kwargs)
+            raise AssertionError(f"PostHog has no route {url}")
 
         self.mock_request.side_effect = request
         self.storage_answer = storage
@@ -217,24 +206,23 @@ class PostHogBackendMockAPITestCase(RequestsBackendMockAPITestCase):
     def calls(self, url_prefix):
         """Every request to a URL starting with url_prefix, in order.
 
-        A storage upload shows the prepared request as it went out.
+        A storage upload shows the request as it went out.
         """
-        on_the_wire = [
+        to_posthog = [call.kwargs for call in self.mock_request.call_args_list]
+        to_storage = [
             {
-                "method": call.args[1].method,
-                "url": call.args[1].url,
-                "headers": dict(call.args[1].headers),
-                "data": call.args[1].body,
+                "method": call.request.method,
+                "url": call.request.url,
+                "headers": dict(call.request.headers),
+                "data": call.request.body,
             }
-            for call in self.mock_send.call_args_list
+            for call in self.storage.calls
         ]
-        wire_urls = {call["url"] for call in on_the_wire}
-        requests_sent = [
-            call.kwargs
-            for call in self.mock_request.call_args_list
-            if call.kwargs["url"] not in wire_urls
-        ] + on_the_wire
-        return [call for call in requests_sent if call["url"].startswith(url_prefix)]
+        return [
+            call
+            for call in to_posthog + to_storage
+            if call["url"].startswith(url_prefix)
+        ]
 
     def assert_not_sent(self):
         self.assertEqual(self.calls(SEND_URL), [])
@@ -701,6 +689,14 @@ class PostHogSendTests(PostHogBackendMockAPITestCase):
         self.message.send()
         self.assertEqual(self.get_api_call_json()["future_field"], "value")
 
+    def test_anymail_status_follows_esp_extra_recipients(self):
+        self.message.cc = ["bo@example.com"]
+        self.message.esp_extra = {"to": "carol@example.com", "cc": []}
+        self.message.send()
+        self.assertEqual(
+            set(self.message.anymail_status.recipients), {"carol@example.com"}
+        )
+
     def test_anymail_status(self):
         self.message.cc = ["bo@example.com"]
         sent = self.message.send()
@@ -990,6 +986,31 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
         self.assertEqual(error.detail, "The request signature does not match")
         self.assertEqual(len(self.calls(STORAGE_URL)), 1)
 
+    def test_expired_upload_url_is_retryable(self):
+        # A retry of the send asks PostHog for a fresh upload URL.
+        self.fake_posthog(
+            storage=self.response(
+                403,
+                raw=b"<Error><Code>AccessDenied</Code>"
+                b"<Message>Request has expired</Message></Error>",
+            )
+        )
+        self.assert_upload_error(
+            "attachment_upload_failed",
+            status=403,
+            retryable=True,
+            attr="attachments__0",
+        )
+
+    def test_unnamed_inline_image_gets_a_file_name(self):
+        self.fake_posthog()
+        self.message.attachments = []
+        cid = self.message.attach_inline_image(LOGO, subtype="png")
+        self.message.send()
+        (attachment,) = self.get_api_call_json()["attachments"]
+        self.assertEqual(attachment["filename"], "attachment.png")
+        self.assertEqual(attachment["content_id"], cid)
+
     def test_storage_fault_is_retryable(self):
         self.fake_posthog(
             storage=self.response(503, raw=b"", headers={"Retry-After": "2"})
@@ -1013,7 +1034,7 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
             retryable=False,
             attr="attachments__0",
         )
-        self.assertEqual(self.mock_send.call_count, 1)
+        self.assertEqual(len(self.storage.calls), 1)
 
     def test_storage_unreachable_is_retryable(self):
         self.fake_posthog(storage=requests.ConnectionError("blocked by firewall"))
@@ -1052,14 +1073,18 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
 
     def test_netrc_credentials_never_go_to_storage(self):
         self.fake_posthog()
-        with (
-            patch(
-                "requests.sessions.get_netrc_auth", return_value=("user", "password")
-            ),
-            patch("requests.utils.get_netrc_auth", return_value=("user", "password")),
-        ):
-            self.message.send()
-        for upload in self.calls(STORAGE_URL):
+        with tempfile.TemporaryDirectory() as home:
+            netrc = os.path.join(home, ".netrc")
+            with open(netrc, "w") as file:
+                file.write(
+                    "machine attachments.s3.us-east-1.amazonaws.com"
+                    " login user password netrc-password\n"
+                )
+            with patch.dict(os.environ, {"NETRC": netrc}):
+                self.message.send()
+        uploads = self.calls(STORAGE_URL)
+        self.assertEqual(len(uploads), 2)
+        for upload in uploads:
             self.assertNotIn("Authorization", upload["headers"])
 
     def test_esp_extra_attachment_reference_sends_without_upload(self):
@@ -1119,8 +1144,6 @@ class PostHogLocalUploadTests(PostHogBackendMockAPITestCase):
                 slot = upload_slot({"sha256": sha256_hex(INVOICE), "size": 8})
                 slot["url"] = local_storage + sha256_hex(INVOICE)
                 return self.response(200, {"files": [slot]})
-            if url.startswith(local_storage):
-                return REAL_SESSION_REQUEST(session, method, url, **kwargs)
             return self.response(202, json.loads(self.DEFAULT_RAW_RESPONSE))
 
         self.mock_request.side_effect = request
@@ -1229,6 +1252,28 @@ class PostHogErrorMapTests(PostHogBackendMockAPITestCase):
         self.assertIs(error.retryable, True)
         self.assertIsNone(error.retry_after)
 
+    def test_request_that_cannot_go_out_is_not_retryable(self):
+        self.patch_request.stop()
+        self.message.esp_extra = {"idempotency_key": "order-981\nshipped"}
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        self.assertIsNone(cm.exception.status_code)
+        self.assertIs(cm.exception.retryable, False)
+
+    @override_settings(
+        MAILERS={
+            "default": {
+                "BACKEND": "anymail.backends.posthog.EmailBackend",
+                "OPTIONS": {**POSTHOG_BASE_OPTIONS, "api_url": "us.posthog.com"},
+            },
+        },
+    )
+    def test_api_url_without_scheme_is_not_retryable(self):
+        self.patch_request.stop()
+        with self.assertRaises(AnymailAPIError) as cm:
+            self.message.send()
+        self.assertIs(cm.exception.retryable, False)
+
     def test_error_body_without_json(self):
         self.set_mock_response(
             status_code=502, raw=b"Bad gateway", content_type="text/html"
@@ -1250,10 +1295,3 @@ class PostHogBackendImproperlyConfiguredTests(AnymailTestMixin, SimpleTestCase):
             r"'secret_key'|\bPOSTHOG_SECRET_KEY.*ANYMAIL_POSTHOG_SECRET_KEY",
         ):
             mail.send_mail("Subject", "Body", "from@example.com", ["to@example.com"])
-
-
-@tag("posthog")
-class PostHogBackendSessionSharingTestCase(
-    SessionSharingTestCases, PostHogBackendMockAPITestCase
-):
-    """Requests session sharing tests"""

@@ -160,7 +160,9 @@ parts and send anyway---see :ref:`unsupported-features`.
   ``.s3.eu-central-1.amazonaws.com`` for EU Cloud. Anymail never sends your secret key
   to the upload host, and refuses an upload URL that isn't https unless
   ``POSTHOG_API_URL`` is plain http too, as in local
-  development. A failed upload sends no email.
+  development. A failed upload sends no email. PostHog needs a name for each file,
+  so an attachment without one, such as an inline image attached without a filename,
+  goes as ``attachment`` with the extension of its type, such as ``attachment.png``.
 
 **Attachment types have no parameters**
   PostHog takes an attachment's MIME type without parameters such as ``charset``,
@@ -234,7 +236,7 @@ from PostHog carries PostHog's ``code``, ``detail`` and ``attr`` (the field at f
 plus ``retryable`` and ``retry_after``:
 
 * ``retryable`` is ``True`` when the same send may be retried *with the same*
-  ``idempotency_key``: a network error or timeout, a 503, a 409 (the same key is still
+  ``idempotency_key``: a connection error or timeout, a 503, a 409 (the same key is still
   being sent), or a 429 for throttling.
 * ``retry_after`` is the number of seconds PostHog asked you to wait, for a throttled
   429.
@@ -245,7 +247,8 @@ nothing:
 * ``code`` ``"attachment_upload_failed"``: PostHog's file storage refused an upload or
   didn't answer. ``attr`` names the attachment, such as ``"attachments__0"``, and
   ``detail`` carries the storage's reason. It is ``retryable`` when the storage was
-  unreachable or answered a passing fault; a retry asks for a fresh upload URL.
+  unreachable, answered a passing fault, or found the upload URL expired; a retry asks
+  for a fresh upload URL.
 * ``code`` ``"upload_quota_exceeded"`` (a 429): your project uploaded all the file bytes
   it can today. It is not ``retryable``; files PostHog already has don't count.
 * Any other refusal of the upload route, such as ``"message_too_large"`` or
@@ -260,7 +263,8 @@ A success response without a ``message_id`` raises an
 :exc:`~anymail.exceptions.AnymailAPIError` that is not ``retryable``.
 
 On success, :attr:`~anymail.message.AnymailMessage.anymail_status` has status
-``"queued"`` and PostHog's ``message_id`` for every recipient PostHog was sent. With
+``"queued"`` and PostHog's ``message_id`` for every recipient PostHog was sent,
+including recipients that ``esp_extra`` set. With
 :setting:`ANYMAIL_IGNORE_UNSUPPORTED_FEATURES`, recipients Anymail left out
 (extra ``to`` addresses, or ``cc`` and ``bcc`` on a template send) get no status.
 
