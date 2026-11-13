@@ -34,6 +34,9 @@ RENDERED_CONTENT_FIELDS = (
     "attachments",
 )
 
+# PostHog refuses these on a template send only when they carry something.
+COPY_AND_FILE_FIELDS = ("cc", "bcc", "attachments")
+
 RENDERED_ONLY_OPTIONS = ("template_key", "capture_engagement", "tracking", "sensitive")
 
 
@@ -188,14 +191,20 @@ class EmailBackend(AnymailRequestsBackend):
         PostHog gave and without the secret key.
         """
         index = upload.file.attachment_index
+        # A prepared request skips the session's headers, auth and .netrc
+        # credentials, which are for PostHog's API, not for the storage host.
+        request = requests.Request(
+            method=upload.method,
+            url=upload.url,
+            data=upload.file.content,
+            headers=upload.headers,
+        ).prepare()
+        transport = self.session.merge_environment_settings(
+            request.url, proxies={}, stream=False, verify=None, cert=None
+        )
         try:
-            response = self.session.request(
-                method=upload.method,
-                url=upload.url,
-                data=upload.file.content,
-                headers=upload.headers,
-                timeout=self.timeout,
-                allow_redirects=False,
+            response = self.session.send(
+                request, timeout=self.timeout, allow_redirects=False, **transport
             )
         except requests.RequestException as err:
             error = request_error(
@@ -341,8 +350,6 @@ class PostHogPayload(RequestsPayload):
     def __init__(self, message, defaults, backend, *args, **kwargs):
         self.recipients_by_field = {}
         self.from_email = None
-        self.track_opens = None
-        self.track_clicks = None
         self.files_by_sha256 = {}
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {backend.secret_key}"
@@ -367,10 +374,19 @@ class PostHogPayload(RequestsPayload):
 
     def files_to_upload(self):
         """Each file the request names, once, in the order it first appears"""
+        attachments = self.data.get("attachments")
         sha256s = dict.fromkeys(
-            att["sha256"] for att in self.data.get("attachments", [])
+            att.get("sha256")
+            for att in (attachments if isinstance(attachments, list) else [])
+            if isinstance(att, dict)
         )
-        return [self.files_by_sha256[sha256] for sha256 in sha256s]
+        # A reference from esp_extra names a file uploaded earlier, so it has
+        # no bytes here to upload.
+        return [
+            self.files_by_sha256[sha256]
+            for sha256 in sha256s
+            if sha256 in self.files_by_sha256
+        ]
 
     def get_api_endpoint(self):
         return SEND_ENDPOINT
@@ -379,7 +395,15 @@ class PostHogPayload(RequestsPayload):
         return self.serialize_json(self.data)
 
     def check_template_form(self):
-        found = [field for field in RENDERED_CONTENT_FIELDS if field in self.data]
+        found = [
+            field
+            for field in RENDERED_CONTENT_FIELDS
+            if (
+                self.data.get(field)
+                if field in COPY_AND_FILE_FIELDS
+                else field in self.data
+            )
+        ]
         if found:
             self.unsupported_feature(
                 "template_id with from_email, subject, body, reply_to, cc, bcc"
@@ -394,22 +418,27 @@ class PostHogPayload(RequestsPayload):
         if "message_data" in self.data:
             self.unsupported_feature("merge_global_data without template_id")
             del self.data["message_data"]
-        tracking = self.data.get("tracking")
-        if isinstance(tracking, dict) and "capture_engagement" in self.data:
-            # PostHog refuses capture_engagement beside tracking.
-            tracking.setdefault("engagement", self.data.pop("capture_engagement"))
+        self.finish_tracking()
         self.data.setdefault("template_key", "django-anymail")
 
-    def tracking(self):
-        tracking = {}
-        if self.track_opens is not None:
-            tracking["opens"] = self.track_opens
-        if self.track_clicks is not None:
-            tracking["clicks"] = self.track_clicks
-        if tracking.get("clicks") and tracking.get("opens") is False:
+    def finish_tracking(self):
+        """
+        Check tracking after esp_extra merged into it, and keep
+        capture_engagement from travelling beside it, which PostHog refuses.
+        """
+        tracking = self.data.get("tracking")
+        if "tracking" in self.data and "capture_engagement" in self.data:
+            capture_engagement = self.data.pop("capture_engagement")
+            # A boolean tracking already sets engagement.
+            if isinstance(tracking, dict):
+                tracking.setdefault("engagement", capture_engagement)
+        if (
+            isinstance(tracking, dict)
+            and tracking.get("clicks") is True
+            and tracking.get("opens") is False
+        ):
             self.unsupported_feature("track_clicks without track_opens")
             del tracking["clicks"]
-        return tracking
 
     def init_payload(self):
         self.data = {}
@@ -490,17 +519,10 @@ class PostHogPayload(RequestsPayload):
             )
 
     def set_track_opens(self, track_opens):
-        self.track_opens = track_opens
-        self.set_tracking()
+        self.data.setdefault("tracking", {})["opens"] = track_opens
 
     def set_track_clicks(self, track_clicks):
-        self.track_clicks = track_clicks
-        self.set_tracking()
-
-    def set_tracking(self):
-        tracking = self.tracking()
-        if tracking:
-            self.data["tracking"] = tracking
+        self.data.setdefault("tracking", {})["clicks"] = track_clicks
 
     def set_template_id(self, template_id):
         self.data["template_id"] = template_id
