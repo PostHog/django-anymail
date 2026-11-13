@@ -236,8 +236,9 @@ from PostHog carries PostHog's ``code``, ``detail`` and ``attr`` (the field at f
 plus ``retryable`` and ``retry_after``:
 
 * ``retryable`` is ``True`` when the same send may be retried *with the same*
-  ``idempotency_key``: a connection error or timeout, a 503, a 409 (the same key is still
-  being sent), or a 429 for throttling.
+  ``idempotency_key``: a connection error, a timeout, an answer cut off, a 503, a 409
+  (the same key is still being sent), or a 429 for throttling. A request Anymail can't
+  build, such as one with a line break in ``idempotency_key``, is not.
 * ``retry_after`` is the number of seconds PostHog asked you to wait, for a throttled
   429.
 

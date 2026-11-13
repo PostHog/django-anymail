@@ -342,8 +342,12 @@ def describe_storage_error(error, attachment_index):
 
 
 def could_not_reach(error):
-    """A request that never got an answer, which the same send may retry"""
-    return isinstance(error, (requests.ConnectionError, requests.Timeout))
+    """
+    A request that got no full answer, which the same send may retry. requests
+    raises a ValueError, such as InvalidHeader or MissingSchema, only for a
+    request it can't build, which a retry would fail the same way.
+    """
+    return not isinstance(error, ValueError)
 
 
 def attachment_field(attr, files):

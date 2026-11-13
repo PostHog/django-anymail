@@ -1036,16 +1036,21 @@ class PostHogAttachmentUploadTests(PostHogBackendMockAPITestCase):
         )
         self.assertEqual(len(self.storage.calls), 1)
 
-    def test_storage_unreachable_is_retryable(self):
-        self.fake_posthog(storage=requests.ConnectionError("blocked by firewall"))
-        with self.assertRaises(AnymailAPIError) as cm:
-            self.message.send()
-        error = cm.exception
-        self.assertIsNone(error.status_code)
-        self.assertEqual(error.code, "attachment_upload_failed")
-        self.assertEqual(error.attr, "attachments__0")
-        self.assertIs(error.retryable, True)
-        self.assert_not_sent()
+    def test_storage_unreachable_or_cut_off_is_retryable(self):
+        for fault in [
+            requests.ConnectionError("blocked by firewall"),
+            requests.exceptions.ChunkedEncodingError("connection broken"),
+        ]:
+            with self.subTest(fault=fault):
+                self.fake_posthog(storage=fault)
+                with self.assertRaises(AnymailAPIError) as cm:
+                    self.message.send()
+                error = cm.exception
+                self.assertIsNone(error.status_code)
+                self.assertEqual(error.code, "attachment_upload_failed")
+                self.assertEqual(error.attr, "attachments__0")
+                self.assertIs(error.retryable, True)
+                self.assert_not_sent()
 
     def test_secret_key_never_goes_to_storage(self):
         self.fake_posthog()
@@ -1251,6 +1256,19 @@ class PostHogErrorMapTests(PostHogBackendMockAPITestCase):
         self.assertIsNone(error.status_code)
         self.assertIs(error.retryable, True)
         self.assertIsNone(error.retry_after)
+
+    def test_answer_cut_off_or_late_is_retryable(self):
+        # PostHog may have queued the email; a retry with the same key is safe.
+        for fault in [
+            requests.exceptions.ChunkedEncodingError("connection broken"),
+            requests.ReadTimeout("read timed out"),
+        ]:
+            with self.subTest(fault=fault):
+                self.mock_request.side_effect = fault
+                with self.assertRaises(AnymailAPIError) as cm:
+                    self.message.send()
+                self.assertIsNone(cm.exception.status_code)
+                self.assertIs(cm.exception.retryable, True)
 
     def test_request_that_cannot_go_out_is_not_retryable(self):
         self.patch_request.stop()
